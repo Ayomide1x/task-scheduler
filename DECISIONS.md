@@ -144,3 +144,75 @@ worker's `processing:<worker_id>` list, not `job:*` hash contents, as the
 source of truth for "what is this worker currently holding." That's a
 deliberate design constraint this decision places on stage 4, not an
 oversight.
+
+## Retries: attempts on the hash, delay via a sorted set, promotion via Lua
+**Chose:** An `attempts` field on `job:<id>`, updated with a plain `HSET`
+(no atomic increment) only in the failure path. A separate sorted set,
+`retry:scheduled` (member = job id, score = eligible unix timestamp), holds
+jobs waiting out their backoff. A Lua script (`promote_retries.lua`) atomically
+moves due jobs from `retry:scheduled` back onto `queue:pending`, called by
+every worker once per loop iteration, ahead of its `BLMOVE`.
+**Over:** Immediately re-queuing a failed job and having the worker
+`time.sleep(backoff)` in-process before running it; a TTL-key +
+keyspace-notification wakeup instead of a polled sorted set; an atomic
+`HINCRBY` for `attempts` instead of a plain read-increment-write.
+**Because:** In-process sleep ties up a worker slot for the entire backoff
+window instead of freeing it for other ready jobs, and makes a
+sleeping-but-alive worker indistinguishable from a dying one to whatever
+staleness check stage 4 adds. Keyspace notifications depend on Pub/Sub,
+already rejected in stage 1 for the same durability reason: a notification
+missed at the exact expiry instant loses the retry silently. The plain
+`HSET` for `attempts` is safe today only because stage 2's claim guarantees
+exactly one worker is ever touching a given job's hash at a time — there is
+no concurrent writer to race.
+**Breaks if (promotion):** `promote_retries.lua` skips atomicity. If two
+workers each read the same due job id and independently `ZREM`+`LPUSH` it,
+the id lands in `queue:pending` twice — two list entries, two separate
+`BLMOVE` calls can each claim one, and the same job runs concurrently on two
+workers. That's the exact thing stage 2's claiming exists to prevent, so
+this has to be one atomic script, not two round trips.
+**Breaks if (attempts):** Stage 4 is exactly what invalidates the "one
+writer at a time" assumption behind the plain `HSET`. A worker a peer has
+declared dead on heartbeat grounds may not actually be dead — just slow, or
+partitioned from Redis but still running. If stage 4's reclaim hands the job
+to a second worker while the first is still alive and later writes its own
+`attempts` update, the two writes race and the increment can be lost (last
+write wins, not last-plus-one). This is the same category of constraint as
+the `processing:<worker_id>`-is-source-of-truth note above: stage 4 inherits
+it and has to design reclaim so a declared-dead worker's own writes can't
+silently clobber the reclaiming worker's, e.g. by having reclaim invalidate
+the old claim in a way the original worker can detect before it writes again.
+**Breaks if (promotion lag):** Promotion is piggybacked on the same loop
+that also runs jobs, not a dedicated process. A worker executing a
+long-running job isn't calling `promote_retries.lua` during that time, so a
+job whose backoff has already elapsed can sit past its `next_attempt_at`
+until some worker in the pool is free to loop again. With every worker busy
+simultaneously, every due retry waits. The fix not being built here: a
+small dedicated promoter (its own process or thread, or the stage-4
+coordinator once one exists) that does nothing but call this script on a
+fixed interval, independent of whether any worker is free. Not needed yet
+at this project's scale, but it's the first thing to add if retry latency
+under load ever becomes a real problem.
+
+## PermanentError: an escape hatch for task-level "never retry this"
+**Chose:** A `PermanentError` exception class in `tasks.py` that task code
+can raise deliberately; the worker catches it before the generic
+`except Exception` and routes straight to the DLQ, skipping backoff
+entirely.
+**Over:** Leaving all task-raised exceptions to go through the normal
+retry path regardless of cause, distinguishing only the scheduler-level
+"unknown task" failure as immediately permanent.
+**Because:** The scheduler has no general way to know whether an
+exception a task raised is transient or will always happen given the same
+input — that's the whole reason task-raised exceptions default to
+retryable. But task authors often *do* know: a validation failure on a
+malformed job argument will fail identically on attempt 5 as it did on
+attempt 1. Without an explicit signal, that job burns all `MAX_ATTEMPTS`
+attempts and the full backoff schedule before landing in the DLQ anyway --
+`PermanentError` lets the task say so up front and skip straight there.
+**Breaks if:** A task author reaches for `PermanentError` reflexively on
+something that was actually transient (e.g. wrapping a flaky network call
+and misjudging one of its failure modes as permanent) — that job gets one
+attempt and no backoff at all, the opposite failure mode from the one this
+exists to fix. The class carries no enforcement of correct usage; it's a
+convention task authors have to apply carefully.
