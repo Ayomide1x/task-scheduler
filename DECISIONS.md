@@ -107,3 +107,40 @@ invert them, and this exact bug returns. The 5s bound also adds up to 5s of
 latency between a job landing and an idle worker noticing, and costs an idle
 worker one wasted round trip every 5 seconds — both negligible here, real at
 large worker counts.
+
+## Claiming: BLMOVE into a per-worker list, not a Lua script
+**Chose:** `BLMOVE queue:pending processing:<worker_id> RIGHT LEFT <timeout>`
+to atomically move a job id out of the pending queue and into a list scoped
+to the worker that claimed it, followed by a plain `HSET` onto the job's
+hash for `status`/`worker_id`/`claimed_at`. The list membership is the
+durable claim record; the hash fields are convenience metadata that may
+legitimately lag or be missing if the worker dies before writing them.
+**Over:** A single Lua script doing `RPOP queue:pending` followed by the
+`HSET`, as one atomic unit (drafted and rejected during design — see the
+tradeoff below).
+**Because:** The two options close different gaps, and the Lua version
+closes the less important one. Under Lua, `RPOP` returns the job id
+directly into the worker process's memory — nowhere in Redis. If the worker
+dies after the script returns but before anything downstream reads that id,
+the id exists nowhere in Redis at all. Recovering it means scanning every
+`job:*` key (or trusting a secondary index that itself has to be kept in
+sync and can drift out from the actual claim state) to notice a job stuck at
+`status: pending` that's no longer in the queue. Under `BLMOVE`, the id
+never leaves Redis — it's relocated, atomically, from one list Redis
+manages to another. If the worker dies immediately after, the id is sitting
+in plain sight in `processing:<worker_id>`, discoverable by reading one
+list, no scan and no secondary index required. What Lua would have bought
+us — `claimed_at` and `worker_id` landing in the same atomic step as the
+pop — is metadata convenience. What it would have cost us — the job id
+itself becoming unrecoverable on a worker crash — is the exact failure this
+stage exists to close. Losing metadata timing is a smaller problem than
+losing the id.
+**Breaks if:** A worker dies between the `BLMOVE` returning and the `HSET`
+landing. The claim is still fully durable (the id is in
+`processing:<worker_id>`), but the job's hash will show stale or missing
+`status`/`worker_id`/`claimed_at` until something reconciles it — meaning
+stage 4's orphan detection cannot trust the hash alone and must treat each
+worker's `processing:<worker_id>` list, not `job:*` hash contents, as the
+source of truth for "what is this worker currently holding." That's a
+deliberate design constraint this decision places on stage 4, not an
+oversight.
