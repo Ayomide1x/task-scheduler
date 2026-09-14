@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """Reliable-claiming worker: move a job id out of queue:pending into this
 worker's own processing list, run it, write the result back onto its hash.
-Failures either get rescheduled with backoff or sent to the DLQ.
+Failures either get rescheduled with backoff or sent to the DLQ. A
+background thread heartbeats this worker's liveness; the main loop reclaims
+jobs left behind by peers whose heartbeat has gone stale.
 
 The processing:<worker_id> list is the durable claim record. The
 status/worker_id/claimed_at fields on job:<id> are convenience metadata,
 written in a separate step after the claim, and may be stale or missing if
 this process dies between the claim and that write -- see DECISIONS.md
-("Claiming: BLMOVE into a per-worker list, not a Lua script"). Stage 4
-(heartbeats + reclaim) is what makes an abandoned processing:<worker_id>
-entry recoverable by another worker; this stage only makes the claim itself
-durable and visible.
+("Claiming: BLMOVE into a per-worker list, not a Lua script").
 
-See DECISIONS.md for the retry/DLQ design: why attempts don't need an
-atomic increment yet, why promotion out of retry:scheduled must be atomic,
-and the promotion-lag cost of piggybacking it on this loop.
+See DECISIONS.md for the retry/DLQ design (stage 3) and the heartbeat/
+reclaim design (stage 4), including the fencing gap the compare-before-write
+guard in run_job narrows but does not close.
 """
 import json
 import os
 import random
+import threading
 import time
 import uuid
 
@@ -33,6 +33,10 @@ MAX_ATTEMPTS = 5
 BACKOFF_BASE_SECONDS = 1
 BACKOFF_CAP_SECONDS = 60
 PROMOTE_BATCH_SIZE = 50
+
+HEARTBEAT_INTERVAL_SECONDS = 2
+HEARTBEAT_TIMEOUT_SECONDS = 15
+MAX_RECLAIMS = 3
 
 PROMOTE_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "promote_retries.lua")
 
@@ -60,7 +64,17 @@ def send_to_dlq(r, key, job_id, attempts, error):
     r.lpush("queue:dead", job_id)
 
 
-def run_job(r, job_id):
+def _still_owns(r, key, worker_id):
+    # Not atomic with whatever write follows -- see DECISIONS.md ("Fencing
+    # gap: compare-before-write narrows, does not close"). A reclaim landing
+    # between this read and the caller's HSET still clobbers; this only
+    # rules out the common case where the reclaim happened well before now
+    # (i.e. sometime during func()'s potentially long execution).
+    status, owner = r.hmget(key, "status", "worker_id")
+    return status == "claimed" and owner == worker_id
+
+
+def run_job(r, job_id, worker_id):
     key = f"job:{job_id}"
     job = r.hgetall(key)
     if not job:
@@ -78,6 +92,8 @@ def run_job(r, job_id):
         # A missing registry entry is a scheduler-level failure: retrying
         # looks up the same name in the same REGISTRY and gets the same
         # None every time. No attempt was made, so attempts is left as-is.
+        # No call to func() happens on this path, so there's no time window
+        # for a reclaim to land -- no ownership check needed here.
         attempts = int(job.get("attempts", 0))
         send_to_dlq(r, key, job_id, attempts, f"unknown task: {task_name}")
         print(f"[worker] {job_id}: unknown task {task_name!r}, sent to DLQ")
@@ -88,18 +104,95 @@ def run_job(r, job_id):
     try:
         result = func(*args)
     except PermanentError as exc:
-        send_to_dlq(r, key, job_id, attempts, str(exc))
-        print(f"[worker] {job_id}: permanent failure - {exc}")
+        if _still_owns(r, key, worker_id):
+            send_to_dlq(r, key, job_id, attempts, str(exc))
+            print(f"[worker] {job_id}: permanent failure - {exc}")
+        else:
+            print(f"[worker] {job_id}: permanent failure - {exc} (discarded, reclaimed elsewhere)")
     except Exception as exc:
-        if attempts >= MAX_ATTEMPTS:
+        if not _still_owns(r, key, worker_id):
+            print(f"[worker] {job_id}: failed - {exc} (discarded, reclaimed elsewhere)")
+        elif attempts >= MAX_ATTEMPTS:
             send_to_dlq(r, key, job_id, attempts, str(exc))
             print(f"[worker] {job_id}: attempts exhausted ({attempts}) - {exc}")
         else:
             schedule_retry(r, key, job_id, attempts, str(exc))
             print(f"[worker] {job_id}: attempt {attempts} failed, retry scheduled - {exc}")
     else:
-        r.hset(key, mapping={"status": "done", "result": json.dumps(result)})
-        print(f"[worker] {job_id}: done - {result!r}")
+        if _still_owns(r, key, worker_id):
+            r.hset(key, mapping={"status": "done", "result": json.dumps(result)})
+            print(f"[worker] {job_id}: done - {result!r}")
+        else:
+            print(f"[worker] {job_id}: succeeded - {result!r} (discarded, reclaimed elsewhere)")
+
+
+def heartbeat_loop(r, worker_id):
+    # Runs on its own thread specifically so it keeps beating while the main
+    # thread is blocked inside a long-running func() call -- a heartbeat
+    # that can only update between jobs is just claimed_at with extra steps.
+    # Safe to share `r` with the main thread: redis-py's client is backed by
+    # a connection pool, which hands out separate sockets per concurrent
+    # caller rather than one socket two threads take turns on.
+    while True:
+        try:
+            r.zadd("workers:heartbeats", {worker_id: time.time()})
+        except redis.RedisError as exc:
+            print(f"[worker] {worker_id}: heartbeat write failed - {exc}")
+        time.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
+def reclaim_dead_workers(r):
+    now = time.time()
+    stale_worker_ids = r.zrangebyscore("workers:heartbeats", "-inf", now - HEARTBEAT_TIMEOUT_SECONDS)
+    for dead_id in stale_worker_ids:
+        processing_key = f"processing:{dead_id}"
+        while True:
+            # LINDEX only peeks -- it doesn't remove anything, so two peers
+            # racing on the same dead worker can both see the same job_id
+            # here and both decide the same destination. That's harmless:
+            # the actual state change is the LMOVE below, and LMOVE is
+            # atomic, so only one of the two racing LMOVE calls actually
+            # moves anything -- the second finds the source already empty
+            # and returns None. Redundant reads are fine; only one mutation
+            # ever lands.
+            job_id = r.lindex(processing_key, -1)
+            if job_id is None:
+                break
+            _reclaim_job(r, processing_key, dead_id, job_id)
+        r.zrem("workers:heartbeats", dead_id)
+
+
+def _reclaim_job(r, processing_key, dead_worker_id, job_id):
+    key = f"job:{job_id}"
+    job = r.hgetall(key)
+    reclaims = int(job.get("reclaims", 0)) + 1
+
+    if reclaims >= MAX_RECLAIMS:
+        # A single LMOVE straight to queue:dead, not a provisional landing
+        # in queue:pending followed by a correction: if we moved it into
+        # queue:pending first, a live worker's BLMOVE could grab and start
+        # running it before we redirect it to the DLQ, leaving the job
+        # simultaneously "in the DLQ" and "being executed" -- a real state
+        # collision, not just an unlikely one. Going directly to the final
+        # destination in one atomic move avoids that window entirely.
+        moved = r.lmove(processing_key, "queue:dead", "RIGHT", "LEFT")
+        if moved is None:
+            return  # a racing peer already reclaimed this entry
+        r.hset(
+            key,
+            mapping={
+                "status": "dead",
+                "reclaims": reclaims,
+                "last_error": f"exceeded max reclaims ({MAX_RECLAIMS}); last owner {dead_worker_id} went stale",
+            },
+        )
+        print(f"[worker] {job_id}: reclaimed from {dead_worker_id}, exceeded max reclaims, sent to DLQ")
+    else:
+        moved = r.lmove(processing_key, "queue:pending", "RIGHT", "LEFT")
+        if moved is None:
+            return  # a racing peer already reclaimed this entry
+        r.hset(key, mapping={"status": "pending", "reclaims": reclaims})
+        print(f"[worker] {job_id}: reclaimed from stale worker {dead_worker_id} (reclaim {reclaims}/{MAX_RECLAIMS})")
 
 
 def main():
@@ -115,6 +208,12 @@ def main():
     with open(PROMOTE_SCRIPT_PATH) as f:
         promote_retries = r.register_script(f.read())
 
+    # daemon=True: this thread must never be the reason the process outlives
+    # a Ctrl+C. It holds no state that needs a clean shutdown -- missing a
+    # last heartbeat on exit is indistinguishable from a crash, which is
+    # already a case every part of this design has to handle regardless.
+    threading.Thread(target=heartbeat_loop, args=(r, worker_id), daemon=True).start()
+
     print(f"[worker] {worker_id}: waiting for jobs on queue:pending")
 
     while True:
@@ -126,6 +225,10 @@ def main():
             keys=["retry:scheduled", "queue:pending"],
             args=[int(time.time()), PROMOTE_BATCH_SIZE],
         )
+
+        # Same piggyback reasoning as promote_retries: a busy pool delays
+        # noticing a dead peer, it doesn't corrupt anything by being late.
+        reclaim_dead_workers(r)
 
         # BLMOVE atomically relocates the id from queue:pending into this
         # worker's own processing list -- the id is never held only in this
@@ -150,7 +253,7 @@ def main():
             },
         )
 
-        run_job(r, job_id)
+        run_job(r, job_id, worker_id)
 
         # Only this worker pushes to and pops from its own processing_key,
         # so this is safe without a Lua script: no other process can be

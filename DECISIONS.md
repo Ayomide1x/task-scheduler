@@ -216,3 +216,144 @@ and misjudging one of its failure modes as permanent) — that job gets one
 attempt and no backoff at all, the opposite failure mode from the one this
 exists to fix. The class carries no enforcement of correct usage; it's a
 convention task authors have to apply carefully.
+
+## Heartbeat runs on a background thread, not the main loop
+**Chose:** A daemon thread, started once at worker startup, doing nothing
+but `ZADD workers:heartbeats {worker_id: now}` every `HEARTBEAT_INTERVAL_
+SECONDS`, independent of the main loop.
+**Over:** Writing the heartbeat at the top of the main loop, in the same
+place `promote_retries`/`reclaim_dead_workers` run.
+**Because:** `run_job` blocks the whole process for the duration of
+whatever the task does. A heartbeat that can only update between jobs
+provides no information during a job's execution — it's indistinguishable
+from `claimed_at`, which stage 2 already has. Given this project has a
+`slow(seconds)` task with caller-controlled duration, any worker running one
+would be wrongly declared dead the moment its runtime passed
+`HEARTBEAT_TIMEOUT_SECONDS`, deterministically, not as a rare fluke. The
+thread is daemonized specifically so it's never the reason the process
+survives a Ctrl+C — it holds no state worth a clean shutdown for, and a
+missed final heartbeat on exit is indistinguishable from a crash, which
+every other part of this design already has to tolerate.
+**Breaks if:** The heartbeat thread hangs or dies independently of the main
+thread (a bug, not modeled here) — the worker keeps processing jobs
+normally while looking dead to its peers, which is the same false-positive
+failure mode discussed below, just from a different cause. Also: sharing
+one `redis.Redis` client between the main thread and this one is safe
+because redis-py's client is backed by a connection pool (separate sockets
+per concurrent caller), not one socket the two threads take turns on — if
+that stopped being true this would need its own client.
+
+## Reclaim: peer workers, sorted-set heartbeats, LMOVE with no Lua
+**Chose:** No dedicated coordinator process. Every worker, once per loop
+iteration, reads `workers:heartbeats` (sorted set: member = worker id,
+score = last heartbeat unix ts) for ids older than `HEARTBEAT_TIMEOUT_
+SECONDS`, and for each one, moves whatever sits in `processing:<dead_id>`
+back into `queue:pending` (or `queue:dead`, if reclaimed too many times)
+via a plain `LMOVE` — no Lua script.
+**Over:** A dedicated coordinator process for detection+reclaim (closer to
+the "coordinator" half of CLAUDE.md's own "a coordinator (or peer worker)"
+phrasing); a Lua script wrapping the reclaim move.
+**Because:** A separate coordinator is a new component for a job this loop
+can already piggyback, the same reasoning stage 3 used for retry promotion.
+The Lua script would be solving a problem that doesn't exist here: unlike
+`promote_retries` (which reads many due ids and acts on all of them in one
+call, requiring one atomic step to avoid double-promoting), reclaiming one
+worker's list is always a single, specific relocation. `LMOVE`'s own
+atomicity already gives us what we need — if two peers race to reclaim the
+same dead worker, the first successful `LMOVE` empties the source, and the
+second peer's call simply returns `None`. Two peers can (harmlessly) both
+compute the same reclaim decision via their own `LINDEX` read; only one of
+them ever succeeds in actually moving anything, because that part is atomic
+and the loser observes an empty source.
+**Breaks if:** The over-`MAX_RECLAIMS` case moves straight to `queue:dead`
+in one `LMOVE`, deliberately not via a provisional landing in
+`queue:pending` followed by a correction. Landing in `queue:pending` first
+would leave a window where a live worker's `BLMOVE` could claim and start
+running the job before this code redirects it to the DLQ — leaving it
+simultaneously "in the DLQ" and "being executed," a real collision of the
+four-state invariant, not a remote one. Going straight to the decided
+destination in one atomic move removes that window entirely.
+
+## Reclaims counted separately from attempts, with their own cap
+**Chose:** A `reclaims` field on `job:<id>`, distinct from `attempts`,
+incremented only by `reclaim_dead_workers`/`_reclaim_job`, capped at
+`MAX_RECLAIMS` before the job goes to the DLQ instead of back to
+`queue:pending`.
+**Over:** Leaving `attempts` untouched by reclaim entirely, with no cap on
+how many times a job can be reclaimed.
+**Because:** A worker dying isn't the job's fault, so folding reclaim into
+the same counter as task-level failures would penalize a job for its
+infrastructure's problems. But leaving reclaim completely unbounded means a
+job that reliably kills every worker that touches it (an OOM trigger, say)
+cycles pending → claimed → orphaned → reclaimed forever, satisfying "never
+silently lost" on a technicality while never actually resolving. A separate
+bounded counter keeps the two failure categories — the task failed vs. the
+task's worker died — independently accounted for while still guaranteeing
+termination for a job that's poison in either sense.
+**Breaks if:** Nothing structurally, but the two counters can both be
+non-zero and telling different stories on the same job (failed twice on its
+own, then orphaned once) — the DLQ's `last_error` only reflects whichever
+one happened last, so the full history of *why* a job died has to be read
+from `attempts` + `reclaims` + `last_error` together, not from `last_error`
+alone.
+**Also inherited from stage 3:** the plain `HSET` used for `attempts` was
+justified there by "only one worker is ever touching a given job's hash at
+a time." Stage 4 is exactly what breaks that assumption — a worker declared
+dead on heartbeat grounds may still be alive and mid-write to the same
+hash. Both `attempts` and `reclaims` remain plain reads-then-writes, not
+atomic increments; see the fencing entry below for how (and how
+incompletely) this is addressed.
+
+## Fencing gap: compare-before-write narrows, does not close
+**Chose:** Before `run_job` writes a final outcome (`done`, DLQ via
+`PermanentError`, DLQ via exhausted attempts, or a scheduled retry) for a
+job that actually called `func()`, it re-reads `status` and `worker_id`
+from the hash and skips the write if either no longer matches (`_still_
+owns`). If a reclaim has already moved the job on, this worker's result is
+logged and discarded instead of written.
+**Over:** No check at all (the pre-stage-4 behavior); a real fencing token.
+**Because:** Without any check, a worker that heartbeat-timed-out but is
+still alive and running writes its result over whatever the reclaiming
+worker (or a second claim after reclaim) has since written — silently,
+since a plain `HSET` doesn't know or care what was there before. The check
+narrows this: it shrinks the vulnerable window from "the job's entire
+execution time" (could be minutes, for a slow task) down to "the time
+between this read and this worker's own subsequent write" — one round
+trip instead of a whole job's runtime.
+**Breaks if:** Be precise about what this is: check-then-write is not
+atomic. A reclaim can land in the gap between `_still_owns` reading
+`status`/`worker_id` and the caller's `HSET` actually executing —
+narrower than before, but still a real window, still open. This does not
+close the problem the previous design conversation identified; it reduces
+its probability, nothing more.
+**The actual fix, not built:** a fencing token — a monotonically increasing
+number written atomically with each claim (e.g. `INCR job:<id>:epoch` at
+claim time, stored alongside `worker_id`), that every subsequent write for
+that job must present and have checked, atomically, against the job's
+current epoch (a Lua script: compare-and-set in one step, not two separate
+round trips like `_still_owns` does now). Reclaiming a job would bump the
+epoch; a zombie worker's write, presenting the old epoch, would be rejected
+by the script itself rather than merely discouraged by a stale-but-still-
+racy Python-side check. This is the standard fix for exactly this class of
+problem (the same idea behind Kubernetes leases, Chubby/ZooKeeper session
+fencing, etc.) and is deliberately not being built here — it's a
+meaningfully larger piece of machinery than this project's scope calls for,
+and the residual risk without it is already bounded by the idempotent-
+handler invariant this project has required since stage 1.
+
+## Known simplification: no clock-skew correction
+**Chose:** Heartbeat scores and the reclaimer's staleness cutoff both use
+each machine's own local wall clock (`time.time()`), with no correction for
+drift between hosts.
+**Because:** For a single-host Docker Compose deployment (stage 8), every
+worker container shares the host's clock, so there is no skew to correct
+for — this is a real simplification, not a false economy, given the
+project's actual deployment target.
+**Breaks if:** This project (or a task modeled on it) ever runs workers
+across multiple machines. Clock drift between hosts would then be
+indistinguishable from an actually-stale heartbeat, or could mask a
+genuinely stale one, without either side doing anything wrong. The fix
+would be routing both the heartbeat write and the staleness comparison
+through a single shared clock (e.g. Redis's own `TIME` command) instead of
+each host's local clock — not needed at this project's current scope, but
+the first thing to revisit if workers ever stop sharing a machine.
