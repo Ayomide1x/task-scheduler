@@ -54,6 +54,10 @@ def cmd_submit(args):
     if status == 429:
         retry_after = headers.get("Retry-After", "?")
         print(f"error: rate limited, retry after {retry_after}s", file=sys.stderr)
+    elif status == 503:
+        retry_after = headers.get("Retry-After", "?")
+        depth = body.get("queue_depth", "?")
+        print(f"error: system overloaded (queue depth {depth}), retry after {retry_after}s", file=sys.stderr)
     else:
         print(f"error: {body.get('error', status)}", file=sys.stderr)
     sys.exit(1)

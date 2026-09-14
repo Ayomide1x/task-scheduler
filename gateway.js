@@ -26,6 +26,14 @@ const RATE_LIMIT_TTL_SECONDS = Math.ceil(RATE_LIMIT_CAPACITY / RATE_LIMIT_REFILL
 
 const DEFAULT_DLQ_LIMIT = 20;
 
+// Backpressure: reject submissions outright once queue:pending is this
+// deep, rather than accepting work the pool has no near-term hope of
+// draining. Unlike the rate limiter's Retry-After (a real calculation from
+// the token deficit), this one is a flat guess -- the gateway has no
+// visibility into how fast the pool is actually draining the backlog.
+const BACKPRESSURE_THRESHOLD = 50;
+const BACKPRESSURE_RETRY_AFTER_SECONDS = 5;
+
 const TOKEN_BUCKET_SCRIPT = fs.readFileSync(path.join(__dirname, "token_bucket.lua"), "utf8");
 
 const app = express();
@@ -80,7 +88,26 @@ async function rateLimit(req, res, next) {
   res.status(429).json({ error: "rate limit exceeded", retry_after_seconds: retryAfterSeconds });
 }
 
-app.post("/jobs", rateLimit, async (req, res) => {
+async function backpressure(req, res, next) {
+  // A global gate, not a per-client one -- the rate limiter above already
+  // handles "this one client is going too fast"; this handles "the pool
+  // can't absorb more work right now regardless of who's asking." A client
+  // well within its own rate limit can still be rejected here because of
+  // everyone else's backlog, and vice versa -- they're orthogonal checks.
+  const depth = await redis.lLen("queue:pending");
+  if (depth < BACKPRESSURE_THRESHOLD) {
+    next();
+    return;
+  }
+  res.set("Retry-After", String(BACKPRESSURE_RETRY_AFTER_SECONDS));
+  res.status(503).json({
+    error: "queue depth exceeds threshold, try again later",
+    queue_depth: depth,
+    threshold: BACKPRESSURE_THRESHOLD,
+  });
+}
+
+app.post("/jobs", rateLimit, backpressure, async (req, res) => {
   const { task, args } = req.body || {};
 
   if (typeof task !== "string" || task.length === 0) {

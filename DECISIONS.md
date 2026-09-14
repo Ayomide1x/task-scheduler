@@ -453,3 +453,35 @@ in this project can now get from `curl` against the gateway instead.
 Recoverable from git history if a direct-to-Redis debug path is ever
 genuinely needed again, but that should be a deliberate decision at the
 time, not a leftover script kept around by default.
+
+## Backpressure: 503 on queue depth, a separate gate from the rate limiter
+**Chose:** A second, independent middleware on `POST /jobs` (`backpressure`,
+running after `rateLimit`) that checks `LLEN queue:pending` and rejects with
+`503` once it's at or past `BACKPRESSURE_THRESHOLD` (50), with a flat
+`Retry-After: 5` rather than a computed one.
+**Over:** Folding this into the rate limiter as one combined check; using
+`429` for both rejection reasons.
+**Because:** The rate limiter and backpressure answer different questions
+about different scopes. The rate limiter (`ratelimit:<ip>`) asks "is this
+one client sending too fast" — a per-client, behavior-based question. This
+asks "can the pool absorb more work at all right now" — a global,
+state-based question with nothing to do with who's asking. A client well
+within its own quota can still get `503`'d by everyone else's backlog, and
+a client can get `429`'d while the queue is nearly empty, purely for its
+own burst. Collapsing them into one check or one status code would lose
+that distinction for anyone reading the response: `429` says "slow down
+yourself," `503` says "the problem isn't you, wait for the system." The
+rate limiter runs first deliberately — it's the cheaper, outer gate meant
+to protect the gateway from any single source regardless of system state,
+so it shouldn't be bypassed just because the system happens to be
+overloaded for unrelated reasons.
+**Breaks if:** `BACKPRESSURE_RETRY_AFTER_SECONDS` is a guess, not a
+calculation, unlike the rate limiter's — the gateway has no visibility into
+actual drain rate (worker count, average job duration), so this number can
+be wrong in either direction: too short (client retries into a queue that's
+still deep, wastes a request) or too long (client waits past when the queue
+already had room). `BACKPRESSURE_THRESHOLD` itself is a single flat number
+with no relationship to actual pool capacity (worker count isn't factored
+in at all) — it bounds queue depth, not queue-depth-relative-to-capacity-to-
+drain-it, which is the thing that actually matters and isn't tracked
+anywhere in this system yet.
