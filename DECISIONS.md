@@ -357,3 +357,99 @@ would be routing both the heartbeat write and the staleness comparison
 through a single shared clock (e.g. Redis's own `TIME` command) instead of
 each host's local clock — not needed at this project's current scope, but
 the first thing to revisit if workers ever stop sharing a machine.
+
+## Rate limiting: token bucket in Lua, IP as client identity
+**Chose:** A single Lua script (`token_bucket.lua`) doing the full
+refill-check-decrement sequence against a per-client hash
+(`ratelimit:<ip>`) in one atomic round trip, applied only to `POST /jobs`.
+Client identity is `req.socket.remoteAddress` — the actual TCP peer
+address — with Express's `trust proxy` left off.
+**Over:** `WATCH`/`MULTI`/`EXEC` for the atomicity; a client-supplied
+header (`X-Client-Id`) or `X-Forwarded-For` for identity.
+**Because:** `WATCH`/`MULTI`/`EXEC` costs at least three round trips in the
+uncontended case and needs client-side retry logic for when `EXEC` aborts;
+the Lua script does the read, refill math, and write server-side in one
+call, with nothing to race against and nothing to retry. On identity: this
+project has no authentication layer, so every identification scheme has a
+bypass — a self-declared header is trivially defeated by sending a
+different value per request, and reading `X-Forwarded-For` with nothing in
+front of this gateway stripping or overwriting it would be worse than no
+rate limiting at all (a free, trivial bypass for anyone willing to set a
+header). The TCP peer address is the one thing a client can't just declare
+a different value for.
+**Breaks if:** Multiple real clients share one public IP (home network,
+corporate NAT, office proxy) — they share one bucket, so one heavy client
+can get its innocent neighbors 429'd for requests they never made. A single
+client that legitimately spans multiple source addresses (horizontal
+scaling, rotating IPs) gets a fresh bucket per address and evades the limit
+entirely, intentionally or not. And concretely for this project: with
+everything running on one machine during actual use (a student's laptop, or
+one Docker Compose host), most or all traffic plausibly arrives from the
+same source address, making per-client limiting behave like a single global
+bucket in practice — worth knowing going in, not a bug to chase down later.
+If a real reverse proxy is ever put in front of this gateway,
+`X-Forwarded-For` becomes the right source for client identity and
+`trust proxy` should be revisited then, not before.
+
+## Cross-language duplication: job schema, and HEARTBEAT_TIMEOUT_SECONDS
+**Chose:** The gateway (`gateway.js`) writes the same job hash shape
+(`task`/`args`/`status`/`created_at`) that `worker.py` reads and writes, as
+an independent implementation in a second language. It also redefines
+`HEARTBEAT_TIMEOUT_SECONDS = 15` locally, to compute `/stats`'
+`workers_alive` the same way `worker.py`'s reclaim logic defines staleness.
+Nothing links these two copies of either value.
+**Over:** A shared schema/config definition (e.g. a JSON or YAML file both
+languages load at startup); making the gateway the only writer of job state
+and having workers read jobs via the gateway too, rather than each talking
+to Redis directly.
+**Because:** Neither alternative was worth building for two small, rarely-
+changing values at this project's current size. A shared config file is
+real infrastructure — a new artifact both a Python and a Node process must
+agree on the location and format of, for something that's currently just
+one string schema and one integer. Making the gateway the sole writer would
+be a much larger architectural change: it would mean workers no longer talk
+to Redis directly for claiming, which contradicts the entire point of this
+project (owning the queue mechanics directly against Redis, not through an
+intermediary service) and would turn the gateway into a second bottleneck
+and single point of failure between every worker and its queue.
+**Breaks if:** Either copy changes without the other. If `worker.py`'s job
+hash schema changes (a renamed field, a new required one) and the gateway
+isn't updated to match, `POST /jobs` will silently write jobs the worker
+can't correctly parse, or `GET /jobs/:id` will silently omit or mis-type a
+field the worker relies on — nothing detects this; it just produces wrong
+behavior downstream with no error at the point of drift. If
+`HEARTBEAT_TIMEOUT_SECONDS` changes in `worker.py` but not in `gateway.js`
+(or vice versa), `/stats`' `workers_alive` count and the workers that
+`reclaim_dead_workers` actually treats as dead silently disagree — the
+gateway could report a worker "alive" that peers have already reclaimed
+from, or the reverse.
+**The real fix, not built:** either a single schema definition both
+languages load (even a plain JSON file listing field names and the shared
+constants, read at startup by both `worker.py` and `gateway.js`, so a
+change in one place is visible to both even if not enforced), or collapsing
+to one writer of job state so there's only one implementation to keep
+correct. Retiring `submit_job.py` in favor of the gateway (see below)
+removes one of what were three independent writers of this schema — a real
+reduction in the drift surface, though it doesn't touch the
+`HEARTBEAT_TIMEOUT_SECONDS` duplication, which remains open.
+
+## submit_job.py retired now that the gateway exists
+**Chose:** Delete `submit_job.py`. Job submission goes through the gateway
+(`POST /jobs`) from stage 5 onward; there is no longer a script that writes
+job state directly to Redis.
+**Over:** Keeping it as a direct-to-Redis dev/testing convenience alongside
+the gateway.
+**Because:** CLAUDE.md already states the reasoning that applies here,
+originally about the CLI: "It must never connect to Redis directly — two
+paths into job state will drift." `submit_job.py` writing the job schema
+independently is exactly that risk, just via a script instead of a second
+service — and it's the same duplication problem the cross-language entry
+above documents, except this copy had no justification left once the
+gateway could do everything it did. Keeping it "just for quick manual
+testing" would mean maintaining a third implementation of the job-write
+path in lockstep with the other two, forever, for a convenience every test
+in this project can now get from `curl` against the gateway instead.
+**Breaks if:** Nothing today — its functionality is fully covered.
+Recoverable from git history if a direct-to-Redis debug path is ever
+genuinely needed again, but that should be a deliberate decision at the
+time, not a leftover script kept around by default.

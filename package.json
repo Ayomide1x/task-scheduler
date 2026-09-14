@@ -1,0 +1,15 @@
+{
+  "name": "task-scheduler-gateway",
+  "version": "1.0.0",
+  "description": "REST gateway for the distributed task scheduler",
+  "main": "gateway.js",
+  "scripts": {
+    "start": "node gateway.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "redis": "^6.2.1"
+  }
+}
