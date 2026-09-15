@@ -1,0 +1,10 @@
+FROM node:20-slim
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY gateway.js token_bucket.lua ./
+
+CMD ["node", "gateway.js"]

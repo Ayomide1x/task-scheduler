@@ -1,0 +1,50 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    init: true
+    ports:
+      - "3000:3000"
+    environment:
+      # localhost inside this container is the container itself, not the
+      # redis service -- "redis" is the service name Compose resolves on
+      # its internal network. The code's own default (localhost:6379) is
+      # correct for running gateway.js directly on the host, not for this.
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    # Without this, worker.py runs as PID 1 in the container. Linux gives
+    # PID 1 special signal semantics: an unhandled SIGTERM is ignored
+    # rather than terminating the process (this is real -- confirmed via
+    # `docker stop` always falling back to SIGKILL, exit 137, every time).
+    # init: true runs a minimal init (tini) as PID 1 instead, so worker.py
+    # runs as PID 2 where normal SIGTERM defaults apply. Doesn't change
+    # correctness -- reclaim handles a hard kill either way -- just removes
+    # a needless wait on every stop/restart.
+    init: true
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    # No ports and no container_name: a worker never listens for anything
+    # (it only polls out to Redis), and a fixed container_name would break
+    # `--scale worker=N`, which needs Compose free to mint one name per
+    # replica.

@@ -485,3 +485,50 @@ with no relationship to actual pool capacity (worker count isn't factored
 in at all) — it bounds queue depth, not queue-depth-relative-to-capacity-to-
 drain-it, which is the thing that actually matters and isn't tracked
 anywhere in this system yet.
+
+## Docker Compose: separate images, service-name DNS, no graceful drain
+**Chose:** Two separate Dockerfiles (`Dockerfile.worker` from
+`python:3.14-slim`, `Dockerfile.gateway` from `node:20-slim`) rather than
+one image running both; `REDIS_URL` overridden per-service in
+`docker-compose.yml` to `redis://redis:6379/0` (the service name, resolved
+on Compose's internal network) rather than the code's own default of
+`redis://localhost:6379/0`, which only works for running these directly on
+the host against Redis's published port; no `SIGTERM` handler in
+`worker.py` for a graceful "finish the current job before exiting" drain.
+**Over:** One combined image with both Python and Node installed; changing
+the code's default `REDIS_URL` instead of overriding it in the compose
+file; adding graceful shutdown.
+**Because:** A combined image mixes two language runtimes for no benefit —
+this project already treats the gateway and workers as separate services in
+separate languages (CLAUDE.md's own stack split), and one image blurs that
+for zero gain. Changing the *default* instead of overriding it per-service
+would break running the code directly on the host (every stage of testing
+in this project so far), for the sake of the one environment (Compose) that
+actually needs a different value — an environment variable override is the
+right tool specifically because the correct value depends on where the
+process runs, and defaulting to the host-friendly value keeps every
+existing local-dev workflow working unchanged. On graceful shutdown: a hard
+kill mid-job is already fully recoverable (stages 2 and 4 exist precisely
+for this), so a `SIGTERM` handler would only reduce wasted work on a
+*routine* stop/restart, not fix a correctness gap — and Docker's default
+stop grace period (10s) is shorter than `HEARTBEAT_TIMEOUT_SECONDS` (15s)
+and can be shorter than a legitimately long job anyway, so a handler
+couldn't fully avoid the hard-kill path regardless.
+**A related bug found and fixed while testing, not a deferred one:**
+`worker.py` runs as PID 1 in its container by default, and Linux gives PID
+1 special signal semantics — an unhandled `SIGTERM` is ignored rather than
+terminating the process. Confirmed directly: `docker stop` on a worker
+container always fell back to the full grace-period wait plus `SIGKILL`
+(exit code 137), even though nothing was blocking a normal shutdown. Fixed
+with `init: true` on both services, which runs a minimal init (tini) as PID
+1 instead, so the actual process runs as PID 2 where ordinary signal
+defaults apply — confirmed after the fix: stop time dropped from ~3.1s to
+~0.1s, exit code changed to 143 (`SIGTERM`, not `SIGKILL`). This didn't
+change correctness (reclaim handled the hard-kill case either way, before
+and after) — it only removed a needless delay on every routine stop.
+**Breaks if:** No graceful drain means a routine `docker compose down` or
+`--scale` scale-down always abandons any in-flight job to the same ~15s
+reclaim path a real crash would need, even when the shutdown was completely
+intentional and the process had every opportunity to finish cleanly. That's
+a real, accepted cost of the choice above, not a side effect of the PID-1
+bug (which is now fixed) — deliberately not closed here.

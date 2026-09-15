@@ -1,0 +1,15 @@
+FROM python:3.14-slim
+
+# Without this, Python fully buffers stdout when it isn't a TTY (true for a
+# container's captured output), so `docker compose logs` shows nothing
+# until the buffer fills or the process exits -- print()s appear to vanish.
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY worker.py tasks.py promote_retries.lua ./
+
+CMD ["python3", "worker.py"]
