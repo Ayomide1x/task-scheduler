@@ -8,6 +8,7 @@ Usage:
     python3 scheduler.py status <job-id>
     python3 scheduler.py stats
     python3 scheduler.py watch
+    python3 scheduler.py dlq [--limit N]
 """
 import argparse
 import json
@@ -76,7 +77,11 @@ def cmd_status(args):
     print(f"job_id:     {body['job_id']}")
     print(f"task:       {body.get('task', '?')}")
     print(f"status:     {body.get('status', '?')}")
+    if "worker_id" in body:
+        print(f"worker_id:  {body['worker_id']}")
     print(f"attempts:   {body.get('attempts', 0)}")
+    if "reclaims" in body:
+        print(f"reclaims:   {body['reclaims']}")
     print(f"last_error: {body.get('last_error', '(none)')}")
     if "result" in body:
         print(f"result:     {body['result']!r}")
@@ -94,6 +99,20 @@ def cmd_stats(args):
         print(f"error: {body.get('error', status)}", file=sys.stderr)
         sys.exit(1)
     _print_stats(body)
+
+
+def cmd_dlq(args):
+    status, body, _headers = _request("GET", f"/dlq?limit={args.limit}")
+    if status != 200:
+        print(f"error: {body.get('error', status)}", file=sys.stderr)
+        sys.exit(1)
+
+    for job in body["jobs"]:
+        print(
+            f"{job['job_id']}  task={job['task']}  attempts={job['attempts'] or 0}  "
+            f"reclaims={job['reclaims'] or 0}  last_error={job['last_error']}"
+        )
+    print(f"\nshowing {body['count']} of {body['total']}")
 
 
 def cmd_watch(args):
@@ -131,6 +150,10 @@ def main():
 
     p_watch = subparsers.add_parser("watch", help="stats on a 1s refresh loop")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_dlq = subparsers.add_parser("dlq", help="show dead-lettered jobs")
+    p_dlq.add_argument("--limit", type=int, default=20)
+    p_dlq.set_defaults(func=cmd_dlq)
 
     args = parser.parse_args()
     args.func(args)

@@ -1,8 +1,20 @@
 services:
   redis:
     image: redis:7-alpine
+    # AOF so queue:pending, job hashes, etc. survive a restart -- without
+    # this, redis:7-alpine's default is no persistence at all, and a
+    # restarted container comes back completely empty. The named volume is
+    # what makes that survive container recreation (`compose down && up`),
+    # not just a process restart inside the same container -- an anonymous
+    # or missing volume would still lose everything the moment the
+    # container itself is removed. See DECISIONS.md: this buys durability
+    # across restarts, not high availability -- Redis is still a single
+    # point of failure with no replication or automatic failover.
+    command: redis-server --appendonly yes
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -48,3 +60,6 @@ services:
     # (it only polls out to Redis), and a fixed container_name would break
     # `--scale worker=N`, which needs Compose free to mint one name per
     # replica.
+
+volumes:
+  redis-data:

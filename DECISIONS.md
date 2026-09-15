@@ -532,3 +532,49 @@ reclaim path a real crash would need, even when the shutdown was completely
 intentional and the process had every opportunity to finish cleanly. That's
 a real, accepted cost of the choice above, not a side effect of the PID-1
 bug (which is now fixed) — deliberately not closed here.
+
+## Redis persistence: AOF + a named volume, not high availability
+**Chose:** `command: redis-server --appendonly yes` on the `redis` service,
+with a named volume (`redis-data:/data`) so the AOF file survives container
+recreation, not just a process restart inside the same container.
+**Over:** Leaving `redis:7-alpine`'s defaults as-is (no persistence at all);
+RDB snapshotting instead of AOF; a replicated Redis (Sentinel or Cluster).
+**Because:** Unlike every other entry in this file, the previous state here
+— no persistence configured at all — wasn't a considered tradeoff, just a
+gap that was never actually decided. `redis:7-alpine` ships with
+persistence off by default, so every restart before this change silently
+returned to an empty database: `queue:pending`, every `job:<id>` hash,
+`retry:scheduled`, `queue:dead`, `workers:heartbeats` — gone, with nothing
+in the system's behavior signaling that it happened. AOF over RDB because
+RDB snapshots on an interval and can lose everything written since the last
+snapshot; AOF (in its default fsync policy) logs every write and loses at
+most about a second's worth on a hard crash — a meaningfully tighter
+guarantee for a system whose entire state *is* its Redis data. The named
+volume matters specifically because a container's own filesystem layer
+doesn't survive `docker compose down` — without a volume, the AOF file
+would be recreated fresh (and empty) on every `up`, making the
+`appendonly yes` setting alone accomplish nothing across that boundary.
+**What this does and does not buy:** This is durability across restarts —
+the same Redis, coming back with the same data. It is not high
+availability. Redis remains a single process and a single point of
+failure: if that container is unhealthy, corrupted, or the host it runs on
+is unreachable, the entire system is down no matter how good the on-disk
+AOF file is, because nothing else can serve traffic while it's
+unavailable — there is no replica to fail over to. Real HA here would mean
+Redis Sentinel (a set of separate monitor processes that watch a
+primary/replica pair and promote a replica automatically if the primary
+dies) or Redis Cluster (data sharded and replicated across multiple Redis
+nodes with no single primary at all). Both are out of scope: they turn
+"one Redis container" into a small distributed system in its own right —
+multiple nodes, a consensus/quorum mechanism for failover, and client
+logic that knows how to find the current primary after one — which is
+real infrastructure this project's single-host Docker Compose scope was
+never meant to carry. AOF plus a volume closes the gap that was an
+oversight; it deliberately does not close the gap that was always a known,
+accepted scope boundary.
+**Breaks if:** The volume is deleted or the host disk holding it is lost —
+AOF durability is only as good as the storage under it, and Compose's
+default local volume driver keeps data on the one host running it, so this
+still doesn't survive losing that machine. And AOF's default fsync policy
+(`everysec`) means a crash can still lose up to about a second of the most
+recent writes — durable, not lossless.

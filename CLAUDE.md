@@ -72,13 +72,14 @@ Build strictly in this order. Do not skip ahead.
 
 ## CLI
 
-Four commands, thin wrappers over the REST gateway:
+Five commands, thin wrappers over the REST gateway:
 
 ```
 scheduler submit <task> [args]   # enqueue, print job id
 scheduler status <job-id>        # state, attempt count, last error
 scheduler stats                  # queue depth, active workers, DLQ size
 scheduler watch                  # stats on a 1s refresh loop
+scheduler dlq [--limit N]        # dead-lettered jobs: id, task, attempts, last error
 ```
 
 Rules:
