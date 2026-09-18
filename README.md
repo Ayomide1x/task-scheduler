@@ -32,25 +32,21 @@ flowchart TB
     W3["Worker"]
 
     CLI -- "HTTP: submit / status / stats / dlq" --> GW
-    GW -- "HSET job:&lt;id&gt;, LPUSH queue:pending" --> R
-    GW -- "token bucket check (Lua)" --> R
+    GW -- "writes job:ID, queue:pending" --> R
 
-    R -- "BLMOVE queue:pending -> processing:&lt;worker_id&gt;" --> W1
-    R -- "BLMOVE" --> W2
-    R -- "BLMOVE" --> W3
-
-    W1 -- "success" --> Done(["status: done"])
-    W1 -- "failure, retries left" --> Retry(["retry:scheduled (ZSET)"])
-    W1 -- "failure, exhausted / permanent" --> DLQ(["queue:dead"])
-    Retry -. "promote_retries.lua, when due" .-> R
-
-    W1 -. heartbeat .-> HB(["workers:heartbeats (ZSET)"])
-    W2 -. "peer notices stale heartbeat,<br/>reclaims orphaned job" .-> HB
+    R -- BLMOVE --> W1
+    R -- BLMOVE --> W2
+    R -- BLMOVE --> W3
 ```
 
 Only the gateway and workers talk to Redis directly. The CLI only ever
 talks HTTP to the gateway — two independent paths into job state would
-drift, so there's exactly one.
+drift, so there's exactly one. The three workers are identical peers, not
+specialized in any way: each claims from the same `queue:pending`, and any
+one of them can reclaim a job left behind by another (see "Watching a
+worker die" below). What each side actually reads and writes in Redis —
+job hashes, retry scheduling, heartbeats, rate limiting — is covered in the
+[Redis keys](#redis-keys) table rather than crammed into this diagram.
 
 ## Quickstart
 
