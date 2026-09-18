@@ -60,6 +60,11 @@ This starts Redis, the gateway (published on `localhost:3000`), and three
 worker replicas, all sharing one queue. Scale the pool up or down anytime
 with `--scale worker=N`.
 
+The Compose stack is the only supported way to run this locally — don't
+run a separate Redis alongside it. A standalone container competing for
+port 6379 is exactly what this replaced, and it has no persistence
+configured, unlike the Compose-managed one (see DECISIONS.md).
+
 In another terminal, use the CLI (Python 3, standard library only — no
 install step):
 

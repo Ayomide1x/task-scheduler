@@ -12,7 +12,8 @@ Core capabilities:
 - Workers that die mid-job have their work reclaimed via heartbeat timeout
 - Jobs that exhaust retries land in a dead-letter queue
 - The gateway rate-limits submissions and applies backpressure on queue depth
-- A CLI submits jobs, checks status, and watches cluster state live
+- A CLI submits jobs, checks status, watches cluster state live, and
+  inspects the dead-letter queue
 
 ## Stack
 
